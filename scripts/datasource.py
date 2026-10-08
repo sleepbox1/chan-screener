@@ -166,6 +166,111 @@ def retry(fn: Callable, tries: int = 4, base: float = 0.6, quiet: bool = True):
 # --------------------------------------------------------------------------- #
 # 快照：股票 / ETF
 # --------------------------------------------------------------------------- #
+# 为什么自己翻页而不用 ak.stock_zh_a_spot_em()：
+#   1. akshare 的分页实现一页失败就整体重来，对外只有一个"成功/异常"，
+#      在云主机 IP 被东财间歇限流时会重试几十分钟然后全部作废；
+#   2. 自研翻页能做到：每页独立重试、页间限速、进度可见、断点续传式重试，
+#      整体成功率远高于"59 页连跪一页就清零"。
+_CLIST_HOSTS = (
+    "https://82.push2.eastmoney.com",
+    "https://push2.eastmoney.com",
+    "https://1.push2.eastmoney.com",
+)
+
+_SPOT_FIELDS = "f12,f14,f2,f3,f9,f23,f8,f6,f20,f21"
+_SPOT_KEYMAP = {
+    "f12": "代码", "f14": "名称", "f2": "最新价", "f3": "涨跌幅",
+    "f9": "市盈率-动态", "f23": "市净率", "f8": "换手率",
+    "f6": "成交额", "f20": "总市值", "f21": "流通市值",
+}
+
+
+def _log(msg: str) -> None:
+    """带时间戳的进度输出（时间戳是排查 Actions 上卡在哪一步的关键）。"""
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def _fetch_spot_pages(fs: str, label: str, page_size: int = 100) -> List[Dict]:
+    """直接调东财 clist 接口翻页拉全量快照。
+
+    每页独立重试（互不影响），页间限速。任何一页重试用尽则抛 DataFetchError，
+    由调用方决定是否回退到 akshare。
+    """
+    import requests
+
+    rows: List[Dict] = []
+    total = None
+    pn = 1
+    session = requests.Session()
+    session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+
+    while True:
+        params = {
+            "pn": pn, "pz": page_size, "po": 1, "np": 1,
+            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+            "fltt": 2, "invt": 2, "fid": "f12",
+            "fs": fs, "fields": _SPOT_FIELDS,
+        }
+        data = None
+        last_err: Optional[Exception] = None
+        for attempt in range(8):
+            host = _CLIST_HOSTS[attempt % len(_CLIST_HOSTS)]
+            try:
+                r = session.get(f"{host}/api/qt/clist/get", params=params, timeout=15)
+                j = r.json()
+                data = (j.get("data") or {}).get("diff")
+                if data is not None:
+                    last_err = None
+                    break
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+            time.sleep(0.5 * (2 ** min(attempt, 4)) + random.uniform(0, 0.4))
+
+        if data is None:
+            raise DataFetchError(
+                f"{label} 第 {pn} 页重试 8 次仍失败: {type(last_err).__name__}: {last_err}"
+            )
+
+        if not data:  # 翻到底了
+            break
+
+        for d in data:
+            row = {}
+            for k, cn in _SPOT_KEYMAP.items():
+                v = d.get(k)
+                row[cn] = None if v in (None, "-", "") else v
+            rows.append(row)
+
+        if total is None:
+            total = int(d.get("total") or 0) if isinstance(d, dict) else 0
+        if pn % 10 == 0 or (total and pn * page_size >= total):
+            got = len(rows)
+            _log(f"  {label} 翻页 {pn} 页，累计 {got}/{total or '?'} 条")
+        if total and len(rows) >= total:
+            break
+        pn += 1
+        time.sleep(0.25)  # 页间限速，降低触发风控概率
+
+    return rows
+
+
+_STOCK_FS = "m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23,m:0 t:81 s:2048"
+_ETF_FS = "b:MK0021,b:MK0022,b:MK0023,b:MK0024,b:MK0827"
+
+
+def _spot_df(fs: str, label: str, akshare_fn, akshare_name: str) -> "pd.DataFrame":
+    """直接翻页优先，失败回退 akshare。返回统一中文列名的 DataFrame。"""
+    try:
+        rows = _fetch_spot_pages(fs, label)
+        if rows:
+            _log(f"  {label} 直连翻页完成，共 {len(rows)} 条")
+            return pd.DataFrame(rows)
+        _log(f"  {label} 直连翻页返回空，回退 {akshare_name}")
+    except Exception as e:  # noqa: BLE001
+        _log(f"  {label} 直连翻页失败（{type(e).__name__}: {e}），回退 {akshare_name}")
+    return retry(akshare_fn, tries=3, quiet=False)
+
+
 def get_stock_universe(
     min_amount: float = 0.0,
     min_total_mv: float = 0.0,
@@ -180,9 +285,9 @@ def get_stock_universe(
     """
     import akshare as ak
 
-    df = retry(lambda: ak.stock_zh_a_spot_em(), tries=4, quiet=False)
+    df = _spot_df(_STOCK_FS, "A股快照", ak.stock_zh_a_spot_em, "stock_zh_a_spot_em")
     if df is None or df.empty:
-        raise RuntimeError("stock_zh_a_spot_em 返回空，可能是接口变更或网络受限")
+        raise RuntimeError("A股快照两个通道都返回空，可能是接口变更或网络受限")
 
     c_code = _pick(df, "代码")
     c_name = _pick(df, "名称")
@@ -274,9 +379,9 @@ def get_etf_universe(exclude_st: bool = True, min_amount: float = 0.0) -> List[D
     """拉取全市场 ETF 快照。ETF 没有市盈率概念，这里不做 PE 过滤。"""
     import akshare as ak
 
-    df = retry(lambda: ak.fund_etf_spot_em(), tries=4, quiet=False)
+    df = _spot_df(_ETF_FS, "ETF快照", ak.fund_etf_spot_em, "fund_etf_spot_em")
     if df is None or df.empty:
-        raise RuntimeError("fund_etf_spot_em 返回空")
+        raise RuntimeError("ETF快照两个通道都返回空")
 
     c_code = _pick(df, "代码")
     c_name = _pick(df, "名称")

@@ -344,27 +344,39 @@ def run(args) -> int:
         print(f"[池] 指定标的 {len(targets)} 只（已尝试补全快照信息）")
     else:
         u = cfg["universe"]
-        print("[池] 拉取全市场 A 股快照 ...")
-        stocks = ds.get_stock_universe(
-            min_amount=u["min_amount"],
-            min_total_mv=u["min_total_mv"],
-            exclude_st=u["exclude_st"],
-            exclude_bse=u["exclude_bse"],
-            require_positive_pe=u["require_positive_pe"],
-        )
+        # 快照是全流程第一步，也是唯一没有逐标的兜底的环节，给它套一层整体重试
+        stocks = None
+        for attempt in (1, 2):
+            try:
+                ds._log("[池] 拉取全市场 A 股快照 ...")
+                stocks = ds.get_stock_universe(
+                    min_amount=u["min_amount"],
+                    min_total_mv=u["min_total_mv"],
+                    exclude_st=u["exclude_st"],
+                    exclude_bse=u["exclude_bse"],
+                    require_positive_pe=u["require_positive_pe"],
+                )
+                break
+            except Exception as e:  # noqa: BLE001
+                ds._log(f"[warn] A股快照第 {attempt} 次失败：{type(e).__name__}: {e}")
+                if attempt == 1:
+                    time.sleep(10)
+        if stocks is None:
+            print("[err] A股快照两次尝试均失败，退出（详见上方 warn 日志）", flush=True)
+            return 3
         print(f"[池] 股票通过基础过滤：{len(stocks)} 只 "
-              f"(已剔除 ST / 北交所 / 动态市盈率≤0 / 停牌)")
+              f"(已剔除 ST / 北交所 / 动态市盈率≤0 / 停牌)", flush=True)
         universe_stat["stocks"] = len(stocks)
 
         etfs: List[Dict] = []
         if cfg["etf"]["enabled"]:
             try:
-                print("[池] 拉取全市场 ETF 快照 ...")
+                ds._log("[池] 拉取全市场 ETF 快照 ...")
                 etfs = ds.get_etf_universe(min_amount=u["min_amount"])
-                print(f"[池] ETF：{len(etfs)} 只（跳过市盈率条件）")
+                print(f"[池] ETF：{len(etfs)} 只（跳过市盈率条件）", flush=True)
                 universe_stat["etfs"] = len(etfs)
             except Exception as e:  # noqa: BLE001
-                print(f"[warn] ETF 快照失败，跳过 ETF：{e}")
+                print(f"[warn] ETF 快照失败，跳过 ETF：{e}", flush=True)
 
         targets = [(s, False) for s in stocks] + [(e, True) for e in etfs]
         if args.sample:
@@ -388,7 +400,7 @@ def run(args) -> int:
         return 2
 
     # ---------- 2. 并发分析 ----------
-    print(f"[扫] 开始分析 {len(targets)} 只标的（并发 {cfg['concurrency']}）...")
+    ds._log(f"[扫] 开始分析 {len(targets)} 只标的（并发 {cfg['concurrency']}）...")
     signals: List[Dict] = []
     reasons: Dict[str, int] = {}
     done = 0
@@ -416,7 +428,7 @@ def run(args) -> int:
                 el = time.time() - t1
                 rate = done / el if el > 0 else 0
                 eta = (len(targets) - done) / rate if rate > 0 else 0
-                print(
+                ds._log(
                     f"    进度 {done}/{len(targets)}  命中 {len(signals)}  "
                     f"{rate:.1f}只/秒  ETA {eta/60:.1f}分"
                 )
