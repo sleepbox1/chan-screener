@@ -390,8 +390,14 @@ def build_bis(
 # --------------------------------------------------------------------------- #
 # 第四步：中枢
 # --------------------------------------------------------------------------- #
-def find_zhongshus(bis: Sequence[Bi], min_bi: int = 3) -> List[Zhongshu]:
+def find_zhongshus(
+    bis: Sequence[Bi], min_bi: int = 3, min_span_pct: float = 0.0
+) -> List[Zhongshu]:
     """连续 min_bi 笔的重叠区间构成中枢；中枢的 ZG / ZD 一经确定便不再改变。
+
+    min_span_pct 是中枢的"有效性下限"：中枢高度 (ZG-ZD)/ZG 必须不低于该比例，
+    否则视为噪音震荡、不成立。30 分钟级别上一两个点内的窄幅重叠几乎全是噪音，
+    过滤掉它们能挡掉大量"伪离开中枢 -> 伪三买"。
 
     中枢延伸到哪一笔结束？这里有两处容易踩坑的地方，说明如下：
 
@@ -418,6 +424,9 @@ def find_zhongshus(bis: Sequence[Bi], min_bi: int = 3) -> List[Zhongshu]:
         zd = max(b.low for b in group)
         if zg <= zd:
             i += 1
+            continue
+        if min_span_pct > 0 and (zg - zd) / zg < min_span_pct:
+            i += 1                      # 重叠区间太窄，判为噪音
             continue
 
         j = i + min_bi
@@ -456,25 +465,30 @@ def find_buys(
     hist: Sequence[float],
     bars_count: int,
     beichi_ratio: float = 0.85,
-    require_beichi: bool = False,
+    require_beichi: bool = True,
+    zs_break_tol: float = 0.003,
 ) -> List[BuyPoint]:
-    """识别一 / 二 / 三类买点。
+    """识别一 / 二 / 三类买点（严格口径）。
 
     ---- 三类买点 ----
-    中枢形成后，一笔向上离开（终点 > ZG），紧接的回调笔不跌回中枢（终点 > ZG）。
+    中枢形成后，一笔向上离开，需同时满足：
+      1. 离开笔终点 > ZG（站上中枢）；
+      2. 离开笔创出**中枢震荡区间的价格新高**（高于中枢内所有笔的高点）——
+         否则只是中枢上沿的又一次震荡，不是"离开"；
+      3. 回调笔终点 > ZG * (1 + zs_break_tol)，即缩量回抽不进中枢。
     该回调笔的终点即三买。
 
     ---- 一类买点 ----
-    一笔向下离开中枢（终点 < ZD），且相对"前一个同向向下笔"出现 MACD 背驰
-    （绿柱面积明显缩小）。该向下笔的终点即一买。
+    一笔向下离开中枢（终点 < ZD），且相对**中枢内最后一根同向向下笔**出现
+    MACD 背驰（绿柱面积明显缩小）。比较对象必须是同一中枢内的前一跌段，
+    用"随便往前找一根向下笔"会拿中枢之前的走势做参照，背驰判据失效。
+    该向下笔的终点即一买。
 
     ---- 二类买点 ----
-    一买之后的反弹笔完成，随后的回调笔终点不破一买低点，该回调笔终点即二买。
-
-    require_beichi 控制二买的宽严：
-      * False（默认）—— 宽松。若某笔向下离开中枢创出阶段新低（终点 < 中枢 ZD），
-        之后反弹 + 回调不破前低，同样认可为二买。命中更多，适合盘后铺开观察。
-      * True —— 严格。必须由 MACD 背驰确认的一买所引出，才认二买。信号更少更精。
+    一买之后的反弹笔完成，随后的**第一次**回调笔终点不破一买低点，该回调笔终点即二买。
+    标准缠论里二买是由一买（背驰）引出的，因此 require_beichi 默认为 True；
+    置为 False 会退化成"任意创阶段新低的向下笔 + 反弹 + 回调不破前低"，
+    命中更多但混入大量非二买结构（历史默认，仅作观察用）。
     """
     out: List[BuyPoint] = []
     n = len(bis)
@@ -500,13 +514,20 @@ def find_buys(
         leave, pull = bis[leave_i], bis[pull_i]
         if leave.direction != 1 or pull.direction != -1:
             continue
-        if leave.end_price > zs.zg and pull.end_price > zs.zg:
+        if leave.end_price <= zs.zg:
+            continue
+        # 必须创出中枢区间的新高，否则只是中枢内的又一次上沿震荡
+        zs_high = max(b.high for b in bis[zs.start_bi : zs.end_bi + 1])
+        if leave.end_price <= zs_high:
+            continue
+        if pull.end_price > zs.zg * (1.0 + zs_break_tol):
             out.append(
                 mk(
                     "3",
                     pull,
                     zs,
-                    f"向上离开中枢上沿 {zs.zg:.2f}，回调至 {pull.end_price:.2f} 未回中枢",
+                    f"向上离开中枢（上沿 {zs.zg:.2f}，创新高 {leave.end_price:.2f}），"
+                    f"回调至 {pull.end_price:.2f} 未回中枢",
                 )
             )
 
@@ -519,12 +540,17 @@ def find_buys(
         if leave.direction != -1 or leave.end_price >= zs.zd:
             continue  # 不是向下离开中枢
 
-        # 背驰：与之前最近的同向（向下）笔比较动能面积
+        # 背驰基准：优先取中枢内最后一根同向（向下）笔，其次才是之前任意同向笔
         prev_down = None
-        for k in range(leave_i - 1, -1, -1):
-            if bis[k].direction == -1:
+        for k in range(zs.end_bi, zs.start_bi - 1, -1):
+            if 0 <= k < n and bis[k].direction == -1:
                 prev_down = bis[k]
                 break
+        if prev_down is None:
+            for k in range(leave_i - 1, -1, -1):
+                if bis[k].direction == -1:
+                    prev_down = bis[k]
+                    break
 
         beichi = False
         ratio_txt = ""
@@ -537,11 +563,11 @@ def find_buys(
                 if beichi:
                     ratio_txt = f"，动能比 {ratio:.2f}（背驰）"
 
-        # 严格模式下，没有背驰确认就不认这个二买
+        # 严格模式：没有背驰确认就不认这条线的二买
         if require_beichi and not beichi:
             continue
 
-        # 二买：寻找"上涨一笔 + 回调一笔"，回调不破前低
+        # 二买：一买之后的第一次「上涨笔 + 回调笔」，回调不破前低
         for k in range(leave_i + 1, n - 1):
             up, pb = bis[k], bis[k + 1]
             if up.direction != 1 or pb.direction != -1:
@@ -553,10 +579,11 @@ def find_buys(
                         "2",
                         pb,
                         zs,
-                        f"{tag} {leave.end_price:.2f} 后回升，回调至 {pb.end_price:.2f} 未破前低{ratio_txt}",
+                        f"{tag} {leave.end_price:.2f} 后回升至 {up.end_price:.2f}，"
+                        f"回抽至 {pb.end_price:.2f} 未破前低{ratio_txt}",
                     )
                 )
-                break  # 每个中枢只取最近一次成立
+            break  # 只认一买后的第一次回抽（标准二买口径）
 
         # 一买本身也记录，供上层参考
         if beichi and leave.end_price < zs.zd:
@@ -584,9 +611,11 @@ def analyze(
     level: str,
     min_gap: int = 4,
     beichi_ratio: float = 0.85,
-    require_beichi: bool = False,
+    require_beichi: bool = True,
+    min_zs_span_pct: float = 0.0,
+    zs_break_tol: float = 0.003,
 ) -> ChanResult:
-    """对一段 K 线做完整缠论分析，返回最新有效买点 + 最新中枢。"""
+    """对一段 K 线做完整缠论分析，返回全部买点 + 最新中枢。"""
     res = ChanResult(
         level=level,
         bar_count=len(bars),
@@ -612,7 +641,7 @@ def analyze(
         res.reason = f"笔数不足({len(bis)})"
         return res
 
-    zs_list = find_zhongshus(bis, min_bi=3)
+    zs_list = find_zhongshus(bis, min_bi=3, min_span_pct=min_zs_span_pct)
     res.bi_count = len(bis)
     res.zhongshu_count = len(zs_list)
     res.zhongshu = zs_list[-1] if zs_list else None
@@ -621,7 +650,13 @@ def analyze(
     _, _, hist = macd(closes)
 
     buys = find_buys(
-        bis, zs_list, hist, len(bars), beichi_ratio=beichi_ratio, require_beichi=require_beichi
+        bis,
+        zs_list,
+        hist,
+        len(bars),
+        beichi_ratio=beichi_ratio,
+        require_beichi=require_beichi,
+        zs_break_tol=zs_break_tol,
     )
     res.all_buys = buys
     res.buy = buys[-1] if buys else None
@@ -630,27 +665,52 @@ def analyze(
     return res
 
 
+def _buy_still_valid(
+    b: BuyPoint,
+    last_close: float,
+    break_tolerance: float,
+    max_gain_pct: float,
+) -> str:
+    """判断买点此刻是否仍然有效，有效返回空串，否则返回失效原因。
+
+    三类买点的有效性用**中枢上沿**判定而不是买点价位：三买一旦跌回中枢，
+    结构就破坏了，哪怕还没跌到买点价（回调低点）——这正是"看着像三买、
+    其实已经失效"的典型情况。
+
+    另外加了追高过滤：买点确认后若价格已经涨过 max_gain_pct，
+    说明买点机会已经错过，继续挂着只会误导。
+    """
+    if b.kind == "3" and b.zhongshu is not None:
+        floor = b.zhongshu.zg * (1.0 - break_tolerance)
+        if last_close < floor:
+            return f"已跌回中枢({last_close:.2f}<{floor:.2f})"
+
+    if last_close < b.price * (1.0 - break_tolerance):
+        return f"已跌破买点({last_close:.2f}<{b.price:.2f})"
+
+    if max_gain_pct > 0 and b.price > 0 and last_close > b.price * (1.0 + max_gain_pct):
+        gain = (last_close / b.price - 1.0) * 100.0
+        return f"已涨过头({gain:+.1f}%>+{max_gain_pct*100:.0f}%)"
+    return ""
+
+
 def validate_buy(
     res: ChanResult,
     last_close: float,
     max_bars_ago: int,
     break_tolerance: float = 0.005,
+    max_gain_pct: float = 0.15,
 ) -> Tuple[bool, str]:
-    """买点时效性校验（针对最新买点）。
-
-    条件：
-      1. 存在买点，且其等级在允许集合内；
-      2. 买点确认时间距离最新 K 线不超过 max_bars_ago 根；
-      3. 最新价未有效跌破买点价位（允许 break_tolerance 的容差）。
-    """
+    """买点时效性校验（针对最新买点）。"""
     if not res.ok or res.buy is None:
         return False, res.reason or "无买点"
 
     buy = res.buy
     if buy.bars_ago > max_bars_ago:
         return False, f"买点过期({buy.bars_ago}根前)"
-    if last_close < buy.price * (1.0 - break_tolerance):
-        return False, f"已跌破买点({last_close:.2f}<{buy.price:.2f})"
+    why = _buy_still_valid(buy, last_close, break_tolerance, max_gain_pct)
+    if why:
+        return False, why
     return True, ""
 
 
@@ -660,6 +720,7 @@ def pick_valid_buy(
     last_close: float,
     max_bars_ago: int,
     break_tolerance: float = 0.005,
+    max_gain_pct: float = 0.15,
 ) -> Tuple[Optional[BuyPoint], str]:
     """从全部已识别买点中挑出「最新且仍然有效」的那一个。
 
@@ -672,20 +733,20 @@ def pick_valid_buy(
         return None, res.reason or "无买点"
 
     expired = 0
-    broken = 0
+    invalid = 0
     for b in reversed(res.all_buys):
         if b.kind not in kinds:
             continue
         if b.bars_ago > max_bars_ago:
             expired += 1
             continue
-        if last_close < b.price * (1.0 - break_tolerance):
-            broken += 1
+        if _buy_still_valid(b, last_close, break_tolerance, max_gain_pct):
+            invalid += 1
             continue
         return b, ""
 
     if expired:
         return None, f"买点过期({expired}个)"
-    if broken:
-        return None, f"已跌破买点({broken}个)"
+    if invalid:
+        return None, f"买点已失效({invalid}个)"
     return None, "无符合类型的买点"

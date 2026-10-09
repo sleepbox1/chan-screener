@@ -2,10 +2,10 @@
  "dates": [
   "2026-10-08"
  ],
- "updated_at": "2026-10-08 11:25:46",
+ "updated_at": "2026-10-09 08:36:12",
  "latest": {
   "trade_date": "2026-10-08",
-  "matched": 282,
-  "scanned": 1125
+  "matched": 536,
+  "scanned": 5453
  }
 }

@@ -70,6 +70,13 @@ DEFAULT_CONFIG = {
     "break_tolerance": 0.005,
     "concurrency": 8,
     "etf": {"enabled": True, "same_type_limit": 1},
+    # 买点严格度（缠论原始口径，宁可少而准）
+    "strict": {
+        "require_beichi_for_buy2": True,   # 二买必须由 MACD 背驰的一买引出
+        "min_zs_span_pct": 0.006,          # 中枢最小高度（占上沿比例），过滤窄幅噪音中枢
+        "zs_break_tol": 0.003,             # 三买回调需高于中枢上沿的缓冲比例
+        "max_gain_from_buy_pct": 0.15,     # 现价距买点涨幅上限（追高过滤）
+    },
 }
 
 
@@ -148,6 +155,10 @@ def analyze_one(
         lv_cfg = cfg["levels"]
         kinds = cfg["buy_kinds"]
         tol = cfg["break_tolerance"]
+        st = cfg.get("strict", {})
+        span = float(st.get("min_zs_span_pct", 0.0))
+        zs_tol = float(st.get("zs_break_tol", 0.003))
+        max_gain = float(st.get("max_gain_from_buy_pct", 0.15))
 
         bars30 = ds.get_min_bars(
             code, lv_cfg["m30"]["period"], start30, end, is_etf, "qfq", cache, cache_day
@@ -160,10 +171,17 @@ def analyze_one(
             "30",
             min_gap=lv_cfg["m30"]["min_gap"],
             beichi_ratio=lv_cfg["m30"]["beichi_ratio"],
-            require_beichi=bool(lv_cfg["m30"].get("require_beichi_for_buy2", False)),
+            require_beichi=bool(
+                lv_cfg["m30"].get(
+                    "require_beichi_for_buy2",
+                    st.get("require_beichi_for_buy2", True),
+                )
+            ),
+            min_zs_span_pct=span,
+            zs_break_tol=zs_tol,
         )
         buy30, _ = chan.pick_valid_buy(
-            r30, kinds, r30.last_close, lv_cfg["m30"]["max_bars_ago"], tol
+            r30, kinds, r30.last_close, lv_cfg["m30"]["max_bars_ago"], tol, max_gain
         )
 
         bars5 = ds.get_min_bars(
@@ -176,10 +194,17 @@ def analyze_one(
                 "5",
                 min_gap=lv_cfg["m5"]["min_gap"],
                 beichi_ratio=lv_cfg["m5"]["beichi_ratio"],
-                require_beichi=bool(lv_cfg["m5"].get("require_beichi_for_buy2", False)),
+                require_beichi=bool(
+                    lv_cfg["m5"].get(
+                        "require_beichi_for_buy2",
+                        st.get("require_beichi_for_buy2", True),
+                    )
+                ),
+                min_zs_span_pct=span,
+                zs_break_tol=zs_tol,
             )
             buy5, _ = chan.pick_valid_buy(
-                r5, kinds, r5.last_close, lv_cfg["m5"]["max_bars_ago"], tol
+                r5, kinds, r5.last_close, lv_cfg["m5"]["max_bars_ago"], tol, max_gain
             )
 
         if buy30 is None and buy5 is None:
@@ -288,6 +313,8 @@ def run(args) -> int:
 
     # 越早装越好：让 AkShare 内部那几十页翻页请求也具备重试能力
     ds.install_http_retry()
+    # 探测东财可用性：被限流时立刻熔断，别让每个标的都白等一轮重试
+    ds.probe_eastmoney()
 
     cfg = load_config(args.config)
     if args.no_etf:
@@ -300,7 +327,8 @@ def run(args) -> int:
     os.makedirs(hist_dir, exist_ok=True)
 
     cache = None if args.no_cache else ds.BarCache(os.path.join(ROOT, ".cache", "bars"))
-    cache_day = datetime.now().strftime("%Y-%m-%d")
+    # --cache-day 允许复用历史交易日的缓存做离线复算（数据源被限流时尤其有用）
+    cache_day = args.cache_day or datetime.now().strftime("%Y-%m-%d")
 
     today = datetime.now()
     end = today.strftime("%Y-%m-%d 23:59:59")
@@ -564,6 +592,11 @@ def main() -> int:
     ap.add_argument("--codes", help="指定标的，逗号分隔，如 600519,000001,510300")
     ap.add_argument("--no-etf", action="store_true", help="跳过 ETF")
     ap.add_argument("--no-cache", action="store_true", help="禁用分钟K线磁盘缓存")
+    ap.add_argument(
+        "--cache-day",
+        default="",
+        help="指定缓存目录名（如 2026-10-08），用于复用历史缓存离线复算",
+    )
     ap.add_argument("--concurrency", type=int, default=0, help="并发线程数")
     args = ap.parse_args()
 

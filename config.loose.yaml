@@ -1,0 +1,32 @@
+universe:
+  exclude_st: true
+  exclude_bse: true
+  require_positive_pe: true
+  min_amount: 0
+  min_total_mv: 0
+levels:
+  m30:
+    period: '30'
+    lookback_days: 150
+    max_bars_ago: 16
+    min_gap: 4
+    beichi_ratio: 0.85
+  m5:
+    period: '5'
+    lookback_days: 40
+    max_bars_ago: 48
+    min_gap: 4
+    beichi_ratio: 0.85
+buy_kinds:
+- '2'
+- '3'
+strict:
+  require_beichi_for_buy2: false
+  min_zs_span_pct: 0.0
+  zs_break_tol: 0.0
+  max_gain_from_buy_pct: 0.0
+break_tolerance: 0.005
+concurrency: 8
+etf:
+  enabled: true
+  same_type_limit: 1

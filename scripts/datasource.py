@@ -257,18 +257,175 @@ def _fetch_spot_pages(fs: str, label: str, page_size: int = 100) -> List[Dict]:
 _STOCK_FS = "m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23,m:0 t:81 s:2048"
 _ETF_FS = "b:MK0021,b:MK0022,b:MK0023,b:MK0024,b:MK0827"
 
+# --------------------------------------------------------------------------- #
+# 数据源熔断
+# --------------------------------------------------------------------------- #
+# 东财对云主机/高频 IP 会直接拒连（Connection reset）。一旦发现它不可用，
+# 必须尽快切换并**停止继续尝试**，否则每个标的都要白等一轮重试，
+# 全市场5000只标的会因此多花几小时。
+_EM_FAILS = 0
+_EM_DISABLED = False
+_EM_FAIL_THRESHOLD = 2
 
-def _spot_df(fs: str, label: str, akshare_fn, akshare_name: str) -> "pd.DataFrame":
-    """直接翻页优先，失败回退 akshare。返回统一中文列名的 DataFrame。"""
+
+def em_available() -> bool:
+    return not _EM_DISABLED
+
+
+def _em_mark(ok: bool) -> None:
+    global _EM_FAILS, _EM_DISABLED
+    if ok:
+        _EM_FAILS = 0
+        return
+    _EM_FAILS += 1
+    if _EM_FAILS >= _EM_FAIL_THRESHOLD and not _EM_DISABLED:
+        _EM_DISABLED = True
+        _log(f"  东财连续失败 {_EM_FAILS} 次，本次运行内停用东财，改用备用数据源")
+
+
+def probe_eastmoney() -> bool:
+    """启动时探一次东财分钟线，不可用就直接熔断。
+
+    必须在正式扫描前调用：否则每个标的都要先白等一轮东财重试
+    （约 10~30 秒/只），全市场跑一遍会多花好几个小时。
+    """
+    if _EM_DISABLED:
+        return False
+    import requests
+
     try:
-        rows = _fetch_spot_pages(fs, label)
+        r = requests.get(
+            "https://push2his.eastmoney.com/api/qt/stock/kline/get",
+            params={
+                "fields1": "f1,f2", "fields2": "f51,f52,f53",
+                "ut": "7eea3edcaed734bea9cbfc24409ed989",
+                "klt": "30", "fqt": "1", "secid": "1.600519",
+                "beg": "0", "end": "20500000",
+            },
+            timeout=10,
+        )
+        ok = bool((r.json().get("data") or {}).get("klines"))
+    except Exception:  # noqa: BLE001
+        ok = False
+    if ok:
+        _em_mark(True)
+        _log("  东财通道探测：可用（走前复权行情）")
+    else:
+        _em_mark(False)
+        _EM_DISABLED_force()
+        _log("  东财通道探测：不可用 -> 使用腾讯/新浪备用通道（不复权行情）")
+    return ok
+
+
+def _EM_DISABLED_force() -> None:
+    global _EM_DISABLED
+    _EM_DISABLED = True
+
+
+_SINA_SPOT_URL = (
+    "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+    "Market_Center.getHQNodeData"
+)
+_SINA_STOCK_NODE = "hs_a"
+_SINA_ETF_NODE = "etf_hq_fund"
+
+
+def _fetch_sina_spot(node: str, label: str, page_size: int = 100) -> List[Dict]:
+    """新浪全市场列表（含市盈率 per 字段），作为东财快照的备用通道。"""
+    import requests
+
+    rows: List[Dict] = []
+    pn = 1
+    session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Referer": "https://finance.sina.com.cn",
+        }
+    )
+    while True:
+        params = {
+            "page": pn, "num": page_size, "sort": "symbol", "asc": 1,
+            "node": node, "symbol": "", "_s_r_a": "page",
+        }
+        data = None
+        last_err: Optional[Exception] = None
+        for attempt in range(6):
+            try:
+                r = session.get(_SINA_SPOT_URL, params=params, timeout=15)
+                txt = r.text.strip()
+                if txt.startswith("["):
+                    data = json.loads(txt)
+                    break
+                last_err = RuntimeError(txt[:80])
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+            time.sleep(0.5 * (2 ** min(attempt, 3)) + random.uniform(0, 0.3))
+
+        if data is None:
+            raise DataFetchError(
+                f"{label} 新浪第 {pn} 页失败: {type(last_err).__name__}: {last_err}"
+            )
+        if not data:
+            break
+
+        for d in data:
+            rows.append(
+                {
+                    "代码": d.get("code"),
+                    "名称": d.get("name"),
+                    "最新价": d.get("trade"),
+                    "涨跌幅": d.get("changepercent"),
+                    "市盈率-动态": d.get("per"),
+                    "市净率": d.get("pb"),
+                    "换手率": d.get("turnoverratio"),
+                    "成交额": d.get("amount"),
+                    "总市值": d.get("mktcap"),
+                    "流通市值": d.get("nmc"),
+                }
+            )
+        if len(data) < page_size:
+            break
+        pn += 1
+        time.sleep(0.2)
+        if pn % 10 == 0:
+            _log(f"  {label} 新浪翻页 {pn} 页，累计 {len(rows)} 条")
+    return rows
+
+
+def _spot_df(
+    fs: str,
+    label: str,
+    akshare_fn,
+    akshare_name: str,
+    sina_node: str,
+) -> "pd.DataFrame":
+    """快照三级降级：东财 clist -> 新浪列表 -> akshare。
+
+    任一层成功即返回；东财被熔断后直接跳过，避免每只标的都白等重试。
+    """
+    if em_available():
+        try:
+            rows = _fetch_spot_pages(fs, label)
+            if rows:
+                _em_mark(True)
+                _log(f"  {label} 东财直连完成，共 {len(rows)} 条")
+                return pd.DataFrame(rows)
+            _em_mark(False)
+        except Exception as e:  # noqa: BLE001
+            _em_mark(False)
+            _log(f"  {label} 东财通道失败（{type(e).__name__}: {e}）")
+
+    try:
+        rows = _fetch_sina_spot(sina_node, label)
         if rows:
-            _log(f"  {label} 直连翻页完成，共 {len(rows)} 条")
+            _log(f"  {label} 新浪通道完成，共 {len(rows)} 条")
             return pd.DataFrame(rows)
-        _log(f"  {label} 直连翻页返回空，回退 {akshare_name}")
     except Exception as e:  # noqa: BLE001
-        _log(f"  {label} 直连翻页失败（{type(e).__name__}: {e}），回退 {akshare_name}")
-    return retry(akshare_fn, tries=3, quiet=False)
+        _log(f"  {label} 新浪通道失败（{type(e).__name__}: {e}）")
+
+    _log(f"  {label} 回退 akshare({akshare_name})")
+    return retry(akshare_fn, tries=2, quiet=False)
 
 
 def get_stock_universe(
@@ -285,9 +442,11 @@ def get_stock_universe(
     """
     import akshare as ak
 
-    df = _spot_df(_STOCK_FS, "A股快照", ak.stock_zh_a_spot_em, "stock_zh_a_spot_em")
+    df = _spot_df(
+        _STOCK_FS, "A股快照", ak.stock_zh_a_spot_em, "stock_zh_a_spot_em", _SINA_STOCK_NODE
+    )
     if df is None or df.empty:
-        raise RuntimeError("A股快照两个通道都返回空，可能是接口变更或网络受限")
+        raise RuntimeError("A股快照三个通道都返回空，可能是接口变更或网络受限")
 
     c_code = _pick(df, "代码")
     c_name = _pick(df, "名称")
@@ -379,9 +538,11 @@ def get_etf_universe(exclude_st: bool = True, min_amount: float = 0.0) -> List[D
     """拉取全市场 ETF 快照。ETF 没有市盈率概念，这里不做 PE 过滤。"""
     import akshare as ak
 
-    df = _spot_df(_ETF_FS, "ETF快照", ak.fund_etf_spot_em, "fund_etf_spot_em")
+    df = _spot_df(
+        _ETF_FS, "ETF快照", ak.fund_etf_spot_em, "fund_etf_spot_em", _SINA_ETF_NODE
+    )
     if df is None or df.empty:
-        raise RuntimeError("ETF快照两个通道都返回空")
+        raise RuntimeError("ETF快照三个通道都返回空")
 
     c_code = _pick(df, "代码")
     c_name = _pick(df, "名称")
@@ -490,6 +651,113 @@ def _df_to_bars(df: pd.DataFrame) -> List[RawBar]:
     return bars
 
 
+_TX_SYMBOL_MEMO: Dict[str, str] = {}
+
+
+def to_tx_symbol(code: str) -> str:
+    """把 6 位代码转成腾讯/新浪的带市场前缀代码（sh600519 / sz000001）。
+
+    5 开头是沪市 ETF、1 开头是深市 ETF，其余按首位数字判断：
+    6/9 -> 沪，0/3 -> 深。
+    """
+    code = str(code).zfill(6)
+    if code in _TX_SYMBOL_MEMO:
+        return _TX_SYMBOL_MEMO[code]
+    if code.startswith(("6", "9")) or (code.startswith("5") and not code.startswith("159")):
+        sym = "sh" + code
+    else:
+        sym = "sz" + code
+    _TX_SYMBOL_MEMO[code] = sym
+    return sym
+
+
+def _tx_min_bars(code: str, period: str, start: str, end: str) -> List[RawBar]:
+    """腾讯分钟 K 线通道（备用一）。
+
+    返回格式：[时间(yyyymmddHHMM), 开, 收, 高, 低, 成交量(手), ...]
+    """
+    import requests
+
+    sym = to_tx_symbol(code)
+    r = requests.get(
+        "https://ifzq.gtimg.cn/appstock/app/kline/mkline",
+        params={"param": f"{sym},m{period},,800"},
+        timeout=15,
+    )
+    data = (r.json().get("data") or {}).get(sym) or {}
+    arr = data.get(f"m{period}") or []
+    bars: List[RawBar] = []
+    for row in arr:
+        if not row or len(row) < 6:
+            continue
+        dt = str(row[0])
+        if len(dt) != 12:
+            continue
+        s = f"{dt[:4]}-{dt[4:6]}-{dt[6:8]} {dt[8:10]}:{dt[10:12]}:00"
+        if s < start or s > end:
+            continue
+        try:
+            bars.append(
+                RawBar(
+                    idx=len(bars),
+                    dt=s,
+                    open=float(row[1]),
+                    high=float(row[3]),
+                    low=float(row[4]),
+                    close=float(row[2]),
+                    volume=float(row[5] or 0),
+                )
+            )
+        except (TypeError, ValueError):
+            continue
+    return bars
+
+
+def _sina_min_bars(code: str, period: str, start: str, end: str) -> List[RawBar]:
+    """新浪分钟 K 线通道（备用二）。历史比腾讯长（最多约 1023 根）。"""
+    import requests
+
+    sym = to_tx_symbol(code)
+    r = requests.get(
+        "https://quotes.sina.cn/cn/api/jsonp_v2.php/var_/CN_MarketDataService.getKLineData",
+        params={"symbol": sym, "scale": period, "ma": "no", "datalen": 1023},
+        timeout=20,
+    )
+    txt = r.text
+    lo, hi = txt.find("(["), txt.rfind("])")
+    if lo < 0 or hi < 0:
+        return []
+    try:
+        arr = json.loads(txt[lo + 1 : hi + 1])
+    except Exception:  # noqa: BLE001
+        return []
+
+    bars: List[RawBar] = []
+    for d in arr:
+        s = str(d.get("day") or "")
+        if not s:
+            continue
+        if len(s) == 16:                     # '2026-10-08 14:30'
+            s = s + ":00"
+        if s < start or s > end:
+            continue
+        try:
+            bars.append(
+                RawBar(
+                    idx=len(bars),
+                    dt=s,
+                    open=float(d["open"]),
+                    high=float(d["high"]),
+                    low=float(d["low"]),
+                    close=float(d["close"]),
+                    volume=float(d.get("volume") or 0),
+                )
+            )
+        except (TypeError, ValueError, KeyError):
+            continue
+    return bars
+
+
 def get_min_bars(
     code: str,
     period: str,
@@ -500,10 +768,13 @@ def get_min_bars(
     cache: Optional[BarCache] = None,
     cache_day: str = "",
 ) -> List[RawBar]:
-    """拉取分钟 K 线。
+    """拉取分钟 K 线，三级降级：东财 -> 腾讯 -> 新浪。
 
     period: '5' / '15' / '30' / '60'
     start/end 形如 '2026-07-01 09:30:00'
+
+    注意：东财走前复权（qfq），腾讯/新浪的分钟线是**不复权**行情。
+    备用通道只在东财不可用时启用，除权日附近的结构会有轻微差异。
     """
     if cache is not None:
         cached = cache.get(cache_day, f"{'etf' if is_etf else 'stk'}_{code}", period)
@@ -512,24 +783,40 @@ def get_min_bars(
 
     import akshare as ak
 
-    def _fetch():
-        # 轻微抖动，避免多线程在同一毫秒齐发被对端限流
-        time.sleep(random.uniform(0, 0.12))
-        fn = ak.fund_etf_hist_min_em if is_etf else ak.stock_zh_a_hist_min_em
-        return fn(
-            symbol=code,
-            period=period,
-            adjust=adjust,
-            start_date=start,
-            end_date=end,
-        )
+    bars: List[RawBar] = []
 
-    df = retry(_fetch, tries=5)
-    if df is None:
+    # 通道一：东财（akshare）
+    if em_available():
+        def _fetch():
+            # 轻微抖动，避免多线程在同一毫秒齐发被对端限流
+            time.sleep(random.uniform(0, 0.12))
+            fn = ak.fund_etf_hist_min_em if is_etf else ak.stock_zh_a_hist_min_em
+            return fn(
+                symbol=code,
+                period=period,
+                adjust=adjust,
+                start_date=start,
+                end_date=end,
+            )
+
+        df = retry(_fetch, tries=1)   # 重试交给上面的熔断器，这里只试一次
+        if df is not None:
+            _em_mark(True)
+            bars = _df_to_bars(df) if not df.empty else []
+        else:
+            _em_mark(False)
+
+    # 通道二：腾讯
+    if not bars:
+        bars = retry(lambda: _tx_min_bars(code, period, start, end), tries=3) or []
+
+    # 通道三：新浪
+    if not bars:
+        bars = retry(lambda: _sina_min_bars(code, period, start, end), tries=2) or []
+
+    if not bars:
         # 与"该标的没有数据"区分开：这样上层能看出到底是接口挂了还是标的本身无数据
-        raise DataFetchError(f"{code} {period}分钟 K线获取失败（重试已用尽）")
-
-    bars = _df_to_bars(df) if not df.empty else []
+        raise DataFetchError(f"{code} {period}分钟 K线三个通道均无数据")
 
     # 重排 idx，保证连续
     for i, b in enumerate(bars):
