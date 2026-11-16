@@ -1,0 +1,21 @@
+{
+ "date": "2026-11-16",
+ "level": "shrink",
+ "level_cn": "收缩",
+ "score": -3,
+ "advice": "亏钱效应明显：建议轻仓或空仓观望，等涨停家数回升、昨日涨停转正再考虑进场。",
+ "metrics": {
+  "zt": 32,
+  "dt": 60,
+  "broken": 16,
+  "seal": 0.667,
+  "max_lbc": 4,
+  "prev_premium": 0.2,
+  "prev_date": "2026-11-13",
+  "index_above_ma20": null,
+  "index_dev": null
+ },
+ "missing": [
+  "指数20日线"
+ ]
+}
