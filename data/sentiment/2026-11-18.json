@@ -1,0 +1,21 @@
+{
+ "date": "2026-11-18",
+ "level": "neutral",
+ "level_cn": "中性",
+ "score": -2,
+ "advice": "情绪一般：只做高评分（≥75）且双级别共振的标的，控制单笔仓位，不追高。",
+ "metrics": {
+  "zt": 41,
+  "dt": 40,
+  "broken": 24,
+  "seal": 0.631,
+  "max_lbc": 4,
+  "prev_premium": 0.92,
+  "prev_date": "2026-11-17",
+  "index_above_ma20": null,
+  "index_dev": null
+ },
+ "missing": [
+  "指数20日线"
+ ]
+}
